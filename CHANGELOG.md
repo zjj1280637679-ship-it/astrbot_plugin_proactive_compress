@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 0.2.1 (2026-08-18)
+
+- 修复：`EventMessageType` 不从 `astrbot.api.event` 导出 → 改用 `filter.EventMessageType`。
+- 修复：`MessageEventResult` 无 `set_result_type`（文档示例过时）→ 改用 `result.stop_event()`。
+- 验证：在 AstrBot 运行时 venv 中完整加载插件模块（含全部装饰器）通过。
+
 ## 0.2.0 (2026-08-18)
 
 - 新增：管理员自然语言触发压缩。管理员发送命中 `nl_patterns` 的短句

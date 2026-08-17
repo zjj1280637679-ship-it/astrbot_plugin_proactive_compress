@@ -34,8 +34,6 @@ import time
 from astrbot.api import AstrBotConfig, logger, star
 from astrbot.api.event import (
     AstrMessageEvent,
-    EventMessageType,
-    EventResultType,
     MessageChain,
     MessageEventResult,
     filter,
@@ -50,7 +48,7 @@ from astrbot.core.agent.message import (
 from astrbot.core.utils.active_event_registry import active_event_registry
 from astrbot.core.utils.session_lock import session_lock_manager
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 DEFAULT_INSTRUCTION = (
     "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
@@ -370,9 +368,7 @@ class ProactiveCompressPlugin(star.Star):
         _, final = await self._do_compress(umo, cid, exclude_event=event)
         try:
             event.set_result(
-                MessageEventResult()
-                .message(final)
-                .set_result_type(EventResultType.STOP)
+                MessageEventResult().message(final).stop_event()
             )
         except Exception as exc:
             logger.debug("NL compress: result set failed: %s", exc)
