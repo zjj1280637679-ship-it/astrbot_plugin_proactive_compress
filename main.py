@@ -5,12 +5,12 @@ Design: redundant-replacement asynchronous compression.
 When a conversation's estimated context usage passes ``trigger_ratio``
 (default 60%), the plugin compresses it in the *background* with AstrBot's own
 ``LLMSummaryCompressor`` (same round splitting / summary prompt / sanitization),
-working on an independent snapshot.  When the summary is ready, it is swapped
+working on an independent snapshot. When the summary is ready, it is swapped
 in atomically (a millisecond-scale replace under the per-UMO session lock)
-*merging any turns that arrived while the compression was running*.  The main
-conversation never pauses; the automatic 82% in-request compression remains as
-a safety net.  A stale background result (history already changed past the
-snapshot, e.g. the auto-compression fired first) is discarded.
+*merging any turns that arrived while the compression was running*. The main
+conversation never pauses; AstrBot's in-request compression remains as a
+safety net. A stale background result (history already changed past the
+snapshot, e.g. the built-in compression fired first) is discarded.
 
 Admin triggers:
 - ``/compress`` slash command (alias /压缩上下文 /summarize)
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 
@@ -41,6 +42,7 @@ from astrbot.api.event import (
 from astrbot.core.message.components import Plain
 
 from astrbot.core.agent.context.compressor import LLMSummaryCompressor
+from astrbot.core.agent.context.token_counter import EstimateTokenCounter
 from astrbot.core.agent.message import (
     bind_checkpoint_messages,
     dump_messages_with_checkpoints,
@@ -48,7 +50,7 @@ from astrbot.core.agent.message import (
 from astrbot.core.utils.active_event_registry import active_event_registry
 from astrbot.core.utils.session_lock import session_lock_manager
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 DEFAULT_INSTRUCTION = (
     "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
@@ -79,10 +81,15 @@ _SELF_MARKERS = ("✅ 压缩完成", "⏳ 正在压缩", "❌", "ℹ️")
 )
 class ProactiveCompressPlugin(star.Star):
     def __init__(self, context: star.Context, config: AstrBotConfig):
-        super().__init__(context)
+        super().__init__(context, config)
         self.config = config
-        self._running: dict[str, asyncio.Task] = {}  # per-UMO in-flight compression
-        self._last_compress: dict[str, float] = {}
+        self._token_counter = EstimateTokenCounter()
+        # One delayed-check/compression task per UMO. Keeping the whole
+        # background lifecycle in one task removes the check->spawn TOCTOU gap.
+        self._background_tasks: dict[str, asyncio.Task] = {}
+        self._last_attempt: dict[str, float] = {}
+        self._last_success: dict[str, float] = {}
+        self._terminated = False
 
     # ---------- config helpers ----------
 
@@ -91,15 +98,29 @@ class ProactiveCompressPlugin(star.Star):
 
     def _cfg_float(self, key: str, default: float) -> float:
         try:
-            return float(self.config.get(key, default))
+            value = float(self.config.get(key, default))
         except (TypeError, ValueError):
             return default
+        return value if math.isfinite(value) else default
+
+    def _cfg_float_range(
+        self,
+        key: str,
+        default: float,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        value = self._cfg_float(key, default)
+        return min(max(value, minimum), maximum)
 
     def _cfg_int(self, key: str, default: int) -> int:
         try:
             return int(self.config.get(key, default))
         except (TypeError, ValueError):
             return default
+
+    def _cfg_int_min(self, key: str, default: int, minimum: int = 0) -> int:
+        return max(minimum, self._cfg_int(key, default))
 
     def _cfg_str(self, key: str, default: str) -> str:
         return str(self.config.get(key, default) or "").strip() or default
@@ -109,6 +130,12 @@ class ProactiveCompressPlugin(star.Star):
         if isinstance(value, list):
             return [str(item) for item in value if str(item).strip()]
         return list(default)
+
+    def _trigger_ratio(self) -> float:
+        return self._cfg_float_range("trigger_ratio", 0.6, 0.1, 0.95)
+
+    def _keep_recent_ratio(self) -> float:
+        return self._cfg_float_range("keep_recent_ratio", 0.15, 0.0, 0.3)
 
     def _read_provider_settings(self, umo: str) -> dict:
         try:
@@ -138,30 +165,52 @@ class ProactiveCompressPlugin(star.Star):
 
     @filter.on_llm_response()
     async def maybe_compress(self, event: AstrMessageEvent, response) -> None:
-        if not self._cfg_bool("enabled", True):
+        if self._terminated or not self._cfg_bool("enabled", True):
             return
+
         umo = event.unified_msg_origin
+        existing = self._background_tasks.get(umo)
+        if existing is not None and not existing.done():
+            return
+
         try:
-            asyncio.get_running_loop().create_task(self._background_check(umo))
+            task = asyncio.get_running_loop().create_task(self._background_check(umo))
         except Exception as exc:  # never break the pipeline
             logger.debug("Proactive compress schedule failed: %s", exc)
+            return
+
+        self._background_tasks[umo] = task
+        task.add_done_callback(
+            lambda t, u=umo: self._background_tasks.pop(u, None)
+            if self._background_tasks.get(u) is t
+            else None
+        )
 
     async def _background_check(self, umo: str) -> None:
         try:
-            await asyncio.sleep(self._cfg_int("check_delay_seconds", 5))
-        except asyncio.CancelledError:
-            return
-        try:
+            await asyncio.sleep(self._cfg_int_min("check_delay_seconds", 5))
+            if self._terminated or not self._cfg_bool("enabled", True):
+                return
             await self._maybe_run_compression(umo)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.debug("Proactive compress check failed: %s", exc)
+            logger.warning(
+                "Proactive compress check failed for %s: %s",
+                umo,
+                exc,
+                exc_info=True,
+            )
 
     async def _maybe_run_compression(self, umo: str) -> None:
         now = time.monotonic()
-        if now - self._last_compress.get(umo, 0.0) < self._cfg_int("cooldown_seconds", 300):
+        success_cooldown = self._cfg_int_min("cooldown_seconds", 300)
+        retry_cooldown = self._cfg_int_min("retry_cooldown_seconds", 30)
+
+        if now - self._last_success.get(umo, 0.0) < success_cooldown:
             return
-        if umo in self._running and not self._running[umo].done():
-            return  # one background compression per conversation
+        if now - self._last_attempt.get(umo, 0.0) < retry_cooldown:
+            return
 
         conv_mgr = getattr(self.context, "conversation_manager", None)
         if conv_mgr is None:
@@ -176,7 +225,9 @@ class ProactiveCompressPlugin(star.Star):
             history = json.loads(conv.history or "[]")
         except (TypeError, ValueError):
             return
-        if not isinstance(history, list) or len(history) < self._cfg_int("min_messages", 20):
+        if not isinstance(history, list) or len(history) < self._cfg_int_min(
+            "min_messages", 20, minimum=1
+        ):
             return
 
         provider = self._resolve_provider(umo)
@@ -186,29 +237,72 @@ class ProactiveCompressPlugin(star.Star):
         if not isinstance(max_ctx, int) or max_ctx <= 0:
             return  # no known window -> skip (avoid runaway)
 
-        est = self._estimate_tokens(history)
-        if est <= 0 or est / max_ctx < self._cfg_float("trigger_ratio", 0.6):
+        est, context_mode = self._estimate_tokens(history)
+        if est <= 0:
             return
 
-        self._last_compress[umo] = time.monotonic()
-        task = asyncio.get_running_loop().create_task(
-            self._run_background_compression(umo, cid, history, provider)
+        trigger_ratio = self._trigger_ratio()
+        usage_ratio = est / max_ctx
+        logger.debug(
+            "[ProactiveCompress] %s context=%s tokens=%d/%d (%.1f%%, trigger %.1f%%)",
+            umo,
+            context_mode,
+            est,
+            max_ctx,
+            usage_ratio * 100,
+            trigger_ratio * 100,
         )
-        self._running[umo] = task
-        task.add_done_callback(
-            lambda t, u=umo: self._running.pop(u, None)
-            if self._running.get(u) is t
-            else None
+        if usage_ratio < trigger_ratio:
+            return
+
+        # Attempt and success are intentionally separate. Failed, empty, or stale
+        # work only observes retry_cooldown_seconds; a committed replacement
+        # observes the full cooldown_seconds.
+        self._last_attempt[umo] = time.monotonic()
+        success = await self._run_background_compression(
+            umo,
+            cid,
+            history,
+            provider,
         )
+        if success:
+            self._last_success[umo] = time.monotonic()
 
     @staticmethod
-    def _estimate_tokens(history: list) -> int:
-        chars = sum(
-            len(str(m.get("content", "")))
-            for m in history
-            if isinstance(m, dict) and m.get("role") != "system"
-        )
-        return int(chars / 2)
+    def _detect_context_mode(history: list) -> str:
+        """Return text or multimodal without ever expanding media payloads."""
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") in {"image_url", "audio_url"}
+                ):
+                    return "multimodal"
+        return "text"
+
+    def _estimate_tokens(self, history: list) -> tuple[int, str]:
+        """Use AstrBot's native counter for both text and multimodal history.
+
+        This avoids treating base64/data-URL media as plain text. AstrBot's
+        EstimateTokenCounter assigns media-aware costs and also counts thinking
+        parts and tool calls.
+        """
+        context_mode = self._detect_context_mode(history)
+        try:
+            messages = bind_checkpoint_messages(history)
+            return self._token_counter.count_tokens(messages), context_mode
+        except Exception as exc:
+            logger.warning(
+                "Proactive compress token estimation failed for %s context: %s",
+                context_mode,
+                exc,
+            )
+            return 0, context_mode
 
     def _resolve_provider(self, umo: str):
         ps = self._read_provider_settings(umo)
@@ -224,9 +318,15 @@ class ProactiveCompressPlugin(star.Star):
                 provider = self.context.get_provider_by_id(default_id)
         return provider
 
-    async def _run_background_compression(self, umo: str, cid: str, snapshot: list, provider) -> None:
+    async def _run_background_compression(
+        self,
+        umo: str,
+        cid: str,
+        snapshot: list,
+        provider,
+    ) -> bool:
         try:
-            keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
+            keep_ratio = self._keep_recent_ratio()
             instruction = self._build_instruction(umo)
             messages = bind_checkpoint_messages(snapshot)
             compressor = LLMSummaryCompressor(
@@ -236,47 +336,84 @@ class ProactiveCompressPlugin(star.Star):
             )
             new_messages = await compressor(messages)
             if new_messages is messages:
-                return  # nothing worth summarizing
+                logger.info(
+                    "[ProactiveCompress] %s: compressor returned unchanged history",
+                    umo,
+                )
+                return False
+
             compressed = dump_messages_with_checkpoints(new_messages)
-            await self._atomic_replace(umo, cid, snapshot, compressed)
+            applied = await self._atomic_replace(umo, cid, snapshot, compressed)
+            if not applied:
+                return False
+
             logger.info(
                 "[ProactiveCompress] %s: %d -> %d messages (background)",
                 umo,
                 len(snapshot),
                 len(compressed),
             )
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Proactive compress failed for %s: %s", umo, exc)
+            logger.warning(
+                "Proactive compress failed for %s: %s",
+                umo,
+                exc,
+                exc_info=True,
+            )
+            return False
 
-    async def _atomic_replace(self, umo: str, cid: str, snapshot: list, compressed: list) -> None:
+    async def _atomic_replace(
+        self,
+        umo: str,
+        cid: str,
+        snapshot: list,
+        compressed: list,
+    ) -> bool:
         async with session_lock_manager.acquire_lock(umo):
             conv_mgr = getattr(self.context, "conversation_manager", None)
             if conv_mgr is None:
-                return
+                return False
             conv = await conv_mgr.get_conversation(umo, cid)
             if not conv:
-                return
+                return False
             try:
                 current = json.loads(conv.history or "[]")
             except (TypeError, ValueError):
-                return
+                return False
+
             n = len(snapshot)
             if len(current) < n or current[:n] != snapshot:
                 # Stale redundant result: history already moved past our
-                # snapshot (e.g. auto-compression fired first). Discard.
-                logger.info("[ProactiveCompress] stale result discarded for %s", umo)
-                return
+                # snapshot (e.g. built-in/manual compression fired first).
+                logger.info(
+                    "[ProactiveCompress] stale result discarded for %s",
+                    umo,
+                )
+                return False
+
             extra = current[n:]
             new_history = compressed + extra
-            await conv_mgr.update_conversation(umo, cid, new_history)
+            await conv_mgr.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=new_history,
+            )
+            return True
 
     # ---------- shared compression core ----------
 
-    async def _do_compress(self, umo: str, cid: str, exclude_event=None) -> tuple[str, str]:
+    async def _do_compress(
+        self,
+        umo: str,
+        cid: str,
+        exclude_event=None,
+    ) -> tuple[str, str]:
         """Stop the running agent, then atomically compress under the session
-        lock.  Returns (status, final_message)."""
+        lock. Returns (status, final_message).
+        """
         conv_mgr = getattr(self.context, "conversation_manager", None)
         if conv_mgr is None:
             return "fail", "❌ 无法访问会话管理器。"
@@ -284,7 +421,7 @@ class ProactiveCompressPlugin(star.Star):
         provider = self._resolve_provider(umo)
         if provider is None:
             return "fail", "❌ 未找到压缩用模型（检查 compress_provider_id / llm_compress_provider_id）。"
-        keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
+        keep_ratio = self._keep_recent_ratio()
         instruction = self._build_instruction(umo)
 
         try:
@@ -321,14 +458,39 @@ class ProactiveCompressPlugin(star.Star):
             if new_messages is messages:
                 return "short", "ℹ️ 对话太短（没有需要汇总的旧轮次），无需压缩。"
             new_history = dump_messages_with_checkpoints(new_messages)
-            await conv_mgr.update_conversation(umo, cid, new_history)
-            logger.info("[Compress] %s: %d -> %d messages", umo, before, len(new_history))
+            await conv_mgr.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=new_history,
+            )
+            now = time.monotonic()
+            self._last_attempt[umo] = now
+            self._last_success[umo] = now
+            logger.info(
+                "[Compress] %s: %d -> %d messages",
+                umo,
+                before,
+                len(new_history),
+            )
             return "ok", (
                 f"✅ 压缩完成：{before} 条消息 → {len(new_history)} 条\n"
                 "（保留最近上下文，下次请求生效）"
             )
 
     # ---------- natural-language admin trigger ----------
+
+    def _matches_nl_pattern(self, text: str) -> bool:
+        for pattern in self._cfg_list("nl_patterns", DEFAULT_NL_PATTERNS):
+            try:
+                if re.search(pattern, text):
+                    return True
+            except re.error as exc:
+                logger.warning(
+                    "Ignoring invalid proactive-compress regex %r: %s",
+                    pattern,
+                    exc,
+                )
+        return False
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=900000)
     async def nl_compress(self, event: AstrMessageEvent) -> None:
@@ -338,17 +500,14 @@ class ProactiveCompressPlugin(star.Star):
             return
         if not event.is_admin():
             return
-        text = event.message_str or ""
-        text = text.strip()
+        text = (event.message_str or "").strip()
         if not text or text.startswith("/"):
             return
         if len(text) > 40:
             return  # short intent phrases only, avoid false positives
         if any(marker in text for marker in _SELF_MARKERS):
             return  # ignore our own replies
-
-        patterns = self._cfg_list("nl_patterns", DEFAULT_NL_PATTERNS)
-        if not any(re.search(p, text) for p in patterns):
+        if not self._matches_nl_pattern(text):
             return
 
         umo = event.unified_msg_origin
@@ -358,7 +517,7 @@ class ProactiveCompressPlugin(star.Star):
         cid = await conv_mgr.get_curr_conversation_id(umo)
         if not cid:
             return
-        keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
+        keep_ratio = self._keep_recent_ratio()
         try:
             await event.send(
                 MessageChain([Plain(f"⏳ 正在压缩上下文（保留最近 {keep_ratio:.0%}）…")])
@@ -367,9 +526,7 @@ class ProactiveCompressPlugin(star.Star):
             logger.debug("NL compress: status send failed: %s", exc)
         _, final = await self._do_compress(umo, cid, exclude_event=event)
         try:
-            event.set_result(
-                MessageEventResult().message(final).stop_event()
-            )
+            event.set_result(MessageEventResult().message(final).stop_event())
         except Exception as exc:
             logger.debug("NL compress: result set failed: %s", exc)
 
@@ -390,7 +547,23 @@ class ProactiveCompressPlugin(star.Star):
         if not cid:
             yield event.plain_result("❌ 当前没有对话。")
             return
-        keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
+        keep_ratio = self._keep_recent_ratio()
         yield event.plain_result(f"⏳ 正在压缩上下文（保留最近 {keep_ratio:.0%}）…")
         _, final = await self._do_compress(umo, cid, exclude_event=event)
         yield event.plain_result(final)
+
+    async def terminate(self) -> None:
+        """Cancel all delayed/background work when the plugin is reloaded."""
+        self._terminated = True
+        tasks = [
+            task for task in self._background_tasks.values() if not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        logger.info(
+            "[ProactiveCompress] terminated; cancelled %d background task(s)",
+            len(tasks),
+        )
