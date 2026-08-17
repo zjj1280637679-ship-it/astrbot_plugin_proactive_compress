@@ -55,6 +55,31 @@ AstrBot 原生 LLM 摘要压缩默认在请求内达到约 82% 阈值时触发�
 
 管理员手动触发一次压缩（前台执行，持会话锁，安全）。
 
+## 测试闭环
+
+测试不依赖真实 QQ/NapCat，也不调用真实付费模型。边界使用假的 `ConversationManager` 与 Provider，但消息模型、token 计数器、`LLMSummaryCompressor` 和会话锁来自固定版本的真实 AstrBot。
+
+本地运行：
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m compileall -q main.py tests
+ruff check main.py tests
+pytest -q
+```
+
+当前自动化覆盖：
+
+- 压缩进行中插入新消息，完成后验证新消息原样合流；
+- 快照前缀被其它压缩器改写时，验证 stale 结果整份作废且不写库；
+- 20 万字符的图片 data URL 不按普通文本 token 计数；
+- 同一 UMO 高频触发时始终只有一个后台生命周期任务；
+- 插件 `terminate()` 能取消并回收后台任务；
+- 压缩失败只进入短重试冷却，成功写回进入完整冷却；
+- 配置范围裁剪与错误正则不会打断处理。
+
+`.github/workflows/test.yml` 会在 `main` push、Pull Request 和手动触发时，以 Python 3.12 + AstrBot 4.27.3 重跑同一套测试。
+
 ## 兼容性
 
 - AstrBot `>=4.27,<5`。
