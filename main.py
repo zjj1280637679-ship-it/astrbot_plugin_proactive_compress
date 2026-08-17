@@ -12,17 +12,35 @@ conversation never pauses; the automatic 82% in-request compression remains as
 a safety net.  A stale background result (history already changed past the
 snapshot, e.g. the auto-compression fired first) is discarded.
 
-Admin command:  /compress   (alias: /压缩上下文, /summarize)  — manual on-demand
+Admin triggers:
+- ``/compress`` slash command (alias /压缩上下文 /summarize)
+- Natural-language phrases (default patterns match e.g. "压缩一下上下文",
+  "总结我们的对话") — admin-only, short message, consumed so it never reaches
+  the main LLM.
+
+Compression weighting: the admin may set ``emphasis_instruction`` (e.g.
+"在摘要中额外保留之前遇到的问题及解决方案、未完成事项、用户的偏好") which is
+appended to the summary instruction so the compression model keeps that content
+with higher priority.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 
 from astrbot.api import AstrBotConfig, logger, star
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import (
+    AstrMessageEvent,
+    EventMessageType,
+    EventResultType,
+    MessageChain,
+    MessageEventResult,
+    filter,
+)
+from astrbot.core.message.components import Plain
 
 from astrbot.core.agent.context.compressor import LLMSummaryCompressor
 from astrbot.core.agent.message import (
@@ -32,7 +50,7 @@ from astrbot.core.agent.message import (
 from astrbot.core.utils.active_event_registry import active_event_registry
 from astrbot.core.utils.session_lock import session_lock_manager
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 DEFAULT_INSTRUCTION = (
     "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
@@ -43,11 +61,22 @@ DEFAULT_INSTRUCTION = (
     "5. Write the summary in the user's language.\n"
 )
 
+DEFAULT_NL_PATTERNS = (
+    r"压缩.*(上下文|对话|聊天|记录)",
+    r"(上下文|对话|聊天|记录).*压缩",
+    r"总结.*(上下文|对话|聊天)",
+    r"(上下文|对话|聊天).*总结",
+    r"整理.*(上下文|对话|聊天)",
+)
+
+# Guard against our own reply text re-triggering the natural-language path.
+_SELF_MARKERS = ("✅ 压缩完成", "⏳ 正在压缩", "❌", "ℹ️")
+
 
 @star.register(
     "astrbot_plugin_proactive_compress",
     "羊魔大人",
-    "后台主动上下文压缩：上下文使用率超过阈值（默认60%）时后台静默压缩并原子替换，主对话不停机；管理员可用 /compress 手动兜底。",
+    "后台主动上下文压缩：超过阈值（默认60%）后台静默压缩并原子替换，主对话不停机；管理员可用 /compress 或自然语言触发，压缩时按管理员指令加权保留关键内容。",
     VERSION,
 )
 class ProactiveCompressPlugin(star.Star):
@@ -60,8 +89,7 @@ class ProactiveCompressPlugin(star.Star):
     # ---------- config helpers ----------
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
-        value = self.config.get(key, default)
-        return bool(value)
+        return bool(self.config.get(key, default))
 
     def _cfg_float(self, key: str, default: float) -> float:
         try:
@@ -78,10 +106,40 @@ class ProactiveCompressPlugin(star.Star):
     def _cfg_str(self, key: str, default: str) -> str:
         return str(self.config.get(key, default) or "").strip() or default
 
+    def _cfg_list(self, key: str, default: list) -> list:
+        value = self.config.get(key)
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        return list(default)
+
+    def _read_provider_settings(self, umo: str) -> dict:
+        try:
+            cfg = self.context.get_config(umo=umo)
+            return dict(cfg.get("provider_settings", {})) if cfg else {}
+        except Exception:
+            return {}
+
+    def _build_instruction(self, umo: str) -> str:
+        """Combine the configured summary instruction with the admin emphasis."""
+        base = self._cfg_str("compress_instruction", "") or str(
+            self._read_provider_settings(umo).get("llm_compress_instruction", "")
+        ).strip()
+        if not base:
+            base = DEFAULT_INSTRUCTION
+        emphasis = self._cfg_str("emphasis_instruction", "")
+        if emphasis:
+            base = (
+                f"{base}\n\n<emphasis_priority>\n"
+                "在摘要中特别保留、重点覆盖以下内容：\n"
+                f"{emphasis}\n"
+                "</emphasis_priority>"
+            )
+        return base
+
     # ---------- background trigger: after every LLM response ----------
 
     @filter.on_llm_response()
-    async def maybe_compress(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+    async def maybe_compress(self, event: AstrMessageEvent, response) -> None:
         if not self._cfg_bool("enabled", True):
             return
         umo = event.unified_msg_origin
@@ -147,7 +205,6 @@ class ProactiveCompressPlugin(star.Star):
 
     @staticmethod
     def _estimate_tokens(history: list) -> int:
-        # Cheap estimate: mixed CJK/ASCII text ~0.5 token per character.
         chars = sum(
             len(str(m.get("content", "")))
             for m in history
@@ -156,12 +213,7 @@ class ProactiveCompressPlugin(star.Star):
         return int(chars / 2)
 
     def _resolve_provider(self, umo: str):
-        ps: dict = {}
-        try:
-            cfg = self.context.get_config(umo=umo)
-            ps = dict(cfg.get("provider_settings", {})) if cfg else {}
-        except Exception:
-            pass
+        ps = self._read_provider_settings(umo)
         pid = self._cfg_str("compress_provider_id", "") or str(
             ps.get("llm_compress_provider_id", "")
         ).strip()
@@ -177,9 +229,7 @@ class ProactiveCompressPlugin(star.Star):
     async def _run_background_compression(self, umo: str, cid: str, snapshot: list, provider) -> None:
         try:
             keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
-            instruction = self._cfg_str(
-                "compress_instruction", ""
-            ) or self._read_compress_instruction(umo)
+            instruction = self._build_instruction(umo)
             messages = bind_checkpoint_messages(snapshot)
             compressor = LLMSummaryCompressor(
                 provider=provider,
@@ -201,14 +251,6 @@ class ProactiveCompressPlugin(star.Star):
             raise
         except Exception as exc:
             logger.warning("Proactive compress failed for %s: %s", umo, exc)
-
-    def _read_compress_instruction(self, umo: str) -> str | None:
-        try:
-            cfg = self.context.get_config(umo=umo)
-            ps = dict(cfg.get("provider_settings", {})) if cfg else {}
-            return str(ps.get("llm_compress_instruction") or "").strip() or None
-        except Exception:
-            return None
 
     async def _atomic_replace(self, umo: str, cid: str, snapshot: list, compressed: list) -> None:
         async with session_lock_manager.acquire_lock(umo):
@@ -232,7 +274,110 @@ class ProactiveCompressPlugin(star.Star):
             new_history = compressed + extra
             await conv_mgr.update_conversation(umo, cid, new_history)
 
-    # ---------- manual admin command (foreground fallback) ----------
+    # ---------- shared compression core ----------
+
+    async def _do_compress(self, umo: str, cid: str, exclude_event=None) -> tuple[str, str]:
+        """Stop the running agent, then atomically compress under the session
+        lock.  Returns (status, final_message)."""
+        conv_mgr = getattr(self.context, "conversation_manager", None)
+        if conv_mgr is None:
+            return "fail", "❌ 无法访问会话管理器。"
+
+        provider = self._resolve_provider(umo)
+        if provider is None:
+            return "fail", "❌ 未找到压缩用模型（检查 compress_provider_id / llm_compress_provider_id）。"
+        keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
+        instruction = self._build_instruction(umo)
+
+        try:
+            active_event_registry.request_agent_stop_all(umo, exclude=exclude_event)
+        except Exception as exc:
+            logger.debug("Compress: stop request failed: %s", exc)
+
+        async with session_lock_manager.acquire_lock(umo):
+            conv = await conv_mgr.get_conversation(umo, cid)
+            if not conv:
+                return "fail", "❌ 未找到对话。"
+            try:
+                history = json.loads(conv.history or "[]")
+            except (TypeError, ValueError):
+                history = []
+            if not isinstance(history, list) or not history:
+                return "no_history", "ℹ️ 当前对话没有可压缩的历史。"
+            before = len(history)
+            try:
+                messages = bind_checkpoint_messages(history)
+            except Exception as exc:
+                logger.error("Compress: history bind failed: %s", exc)
+                return "fail", "❌ 历史解析失败，未修改。"
+            compressor = LLMSummaryCompressor(
+                provider=provider,
+                keep_recent_ratio=keep_ratio,
+                instruction_text=instruction,
+            )
+            try:
+                new_messages = await compressor(messages)
+            except Exception as exc:
+                logger.error("Compress: LLM compression failed: %s", exc)
+                return "fail", "❌ 压缩失败，未修改历史。"
+            if new_messages is messages:
+                return "short", "ℹ️ 对话太短（没有需要汇总的旧轮次），无需压缩。"
+            new_history = dump_messages_with_checkpoints(new_messages)
+            await conv_mgr.update_conversation(umo, cid, new_history)
+            logger.info("[Compress] %s: %d -> %d messages", umo, before, len(new_history))
+            return "ok", (
+                f"✅ 压缩完成：{before} 条消息 → {len(new_history)} 条\n"
+                "（保留最近上下文，下次请求生效）"
+            )
+
+    # ---------- natural-language admin trigger ----------
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=900000)
+    async def nl_compress(self, event: AstrMessageEvent) -> None:
+        if not self._cfg_bool("nl_enabled", True):
+            return
+        if not self._cfg_bool("enabled", True):
+            return
+        if not event.is_admin():
+            return
+        text = event.message_str or ""
+        text = text.strip()
+        if not text or text.startswith("/"):
+            return
+        if len(text) > 40:
+            return  # short intent phrases only, avoid false positives
+        if any(marker in text for marker in _SELF_MARKERS):
+            return  # ignore our own replies
+
+        patterns = self._cfg_list("nl_patterns", DEFAULT_NL_PATTERNS)
+        if not any(re.search(p, text) for p in patterns):
+            return
+
+        umo = event.unified_msg_origin
+        conv_mgr = getattr(self.context, "conversation_manager", None)
+        if conv_mgr is None:
+            return
+        cid = await conv_mgr.get_curr_conversation_id(umo)
+        if not cid:
+            return
+        keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
+        try:
+            await event.send(
+                MessageChain([Plain(f"⏳ 正在压缩上下文（保留最近 {keep_ratio:.0%}）…")])
+            )
+        except Exception as exc:
+            logger.debug("NL compress: status send failed: %s", exc)
+        _, final = await self._do_compress(umo, cid, exclude_event=event)
+        try:
+            event.set_result(
+                MessageEventResult()
+                .message(final)
+                .set_result_type(EventResultType.STOP)
+            )
+        except Exception as exc:
+            logger.debug("NL compress: result set failed: %s", exc)
+
+    # ---------- manual admin command ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("compress", alias={"压缩上下文", "summarize"})
@@ -249,63 +394,7 @@ class ProactiveCompressPlugin(star.Star):
         if not cid:
             yield event.plain_result("❌ 当前没有对话。")
             return
-
-        provider = self._resolve_provider(umo)
-        if provider is None:
-            yield event.plain_result("❌ 未找到压缩用模型（检查 compress_provider_id / llm_compress_provider_id）。")
-            return
         keep_ratio = self._cfg_float("keep_recent_ratio", 0.15)
-        instruction = self._cfg_str("compress_instruction", "") or self._read_compress_instruction(umo)
-
-        try:
-            active_event_registry.request_agent_stop_all(umo, exclude=event)
-        except Exception as exc:
-            logger.debug("Manual compress: stop request failed: %s", exc)
-
         yield event.plain_result(f"⏳ 正在压缩上下文（保留最近 {keep_ratio:.0%}）…")
-
-        async with session_lock_manager.acquire_lock(umo):
-            conv = await conv_mgr.get_conversation(umo, cid)
-            if not conv:
-                yield event.plain_result("❌ 未找到对话。")
-                return
-            try:
-                history = json.loads(conv.history or "[]")
-            except (TypeError, ValueError):
-                history = []
-            if not isinstance(history, list) or not history:
-                yield event.plain_result("ℹ️ 当前对话没有可压缩的历史。")
-                return
-            before = len(history)
-            try:
-                messages = bind_checkpoint_messages(history)
-            except Exception as exc:
-                logger.error("Manual compress: history bind failed: %s", exc)
-                yield event.plain_result("❌ 历史解析失败，未修改。")
-                return
-            compressor = LLMSummaryCompressor(
-                provider=provider,
-                keep_recent_ratio=keep_ratio,
-                instruction_text=instruction,
-            )
-            try:
-                new_messages = await compressor(messages)
-            except Exception as exc:
-                logger.error("Manual compress: LLM compression failed: %s", exc)
-                yield event.plain_result("❌ 压缩失败，未修改历史。")
-                return
-            if new_messages is messages:
-                yield event.plain_result("ℹ️ 对话太短（没有需要汇总的旧轮次），无需压缩。")
-                return
-            new_history = dump_messages_with_checkpoints(new_messages)
-            await conv_mgr.update_conversation(umo, cid, new_history)
-            logger.info(
-                "[ManualCompress] %s: %d -> %d messages",
-                umo,
-                before,
-                len(new_history),
-            )
-            yield event.plain_result(
-                f"✅ 压缩完成：{before} 条消息 → {len(new_history)} 条\n"
-                "（保留最近上下文，下次请求生效）"
-            )
+        _, final = await self._do_compress(umo, cid, exclude_event=event)
+        yield event.plain_result(final)
