@@ -2,11 +2,10 @@ name: astrbot_plugin_proactive_compress
 display_name: "后台主动上下文压缩"
 desc: "上下文使用率超过阈值（默认60%）时，后台静默压缩当前对话并原子替换历史（合并压缩期间新增的消息），主对话不停机；管理员可用 /compress 或自然语言指令触发；压缩时按管理员配置的加权指令重点保留关键内容。"
 short_desc: "后台主动压缩长对话上下文，主对话不停机；/compress 或自然语言触发"
-version: "0.2.1"
+version: "0.3.0"
 author: "羊魔大人"
 repo: "https://github.com/zjj1280637679-ship-it/astrbot_plugin_proactive_compress"
-support_platforms:
-  - aiocqhttp
+astrbot_version: ">=4.27,<5"
 tags:
   - 上下文压缩
   - 主动压缩
