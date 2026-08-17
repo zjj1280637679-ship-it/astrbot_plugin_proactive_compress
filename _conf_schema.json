@@ -1,0 +1,56 @@
+{
+  "enabled": {
+    "description": "【总开关】启用后台主动上下文压缩",
+    "type": "bool",
+    "default": true,
+    "hint": "每次 LLM 回复后检查当前对话的上下文使用率，超过阈值即后台静默压缩并原子替换，主对话不停机。"
+  },
+  "trigger_ratio": {
+    "description": "【触发】上下文使用率阈值",
+    "type": "float",
+    "default": 0.6,
+    "hint": "估计 token / 模型上下文窗口 达到该比例时触发后台压缩。0.6=60%；低于 0.1 按 0.1，高于 0.95 按 0.95。"
+  },
+  "min_messages": {
+    "description": "【触发】最少消息数",
+    "type": "int",
+    "default": 20,
+    "hint": "历史消息数低于该值时不触发（避免过度压缩短对话）。"
+  },
+  "cooldown_seconds": {
+    "description": "【触发】同一对话最小压缩间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "同一对话在压缩后至少等待该秒数才会再次触发，避免反复压缩。"
+  },
+  "check_delay_seconds": {
+    "description": "【触发】回复后延迟检查秒数",
+    "type": "int",
+    "default": 5,
+    "hint": "LLM 回复后延迟该秒数再做检查，让本轮收尾，避免与当前请求竞争。"
+  },
+  "keep_recent_ratio": {
+    "description": "【压缩】保留最近上下文比例",
+    "type": "float",
+    "default": 0.15,
+    "hint": "压缩时保留最近 15% 原文（范围 0-0.3），其余汇总为摘要。"
+  },
+  "compress_instruction": {
+    "description": "【压缩】摘要提示词（留空用默认或 provider_settings 的 llm_compress_instruction）",
+    "type": "string",
+    "default": "",
+    "hint": "覆盖 AstrBot 的 llm_compress_instruction；留空则优先用 provider_settings.llm_compress_instruction，再退回内置默认。"
+  },
+  "compress_provider_id": {
+    "description": "【压缩】压缩用模型 ID（留空用 provider_settings.llm_compress_provider_id 或默认模型）",
+    "type": "string",
+    "default": "",
+    "hint": "例如 volcengine-ark/deepseek-v4-pro-ga-260813（走免费额度的压缩模型）；留空则用配置里的 llm_compress_provider_id。"
+  },
+  "command_enabled": {
+    "description": "【命令】允许管理员 /compress 手动压缩",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 /compress 只提示已关闭，不影响后台主动压缩。"
+  }
+}
