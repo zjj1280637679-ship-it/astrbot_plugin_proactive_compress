@@ -18,6 +18,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Verify repository-only assets stay out of archives
+        shell: bash
+        run: |
+          git archive --format=zip HEAD -o /tmp/plugin.zip
+          if unzip -Z1 /tmp/plugin.zip | grep -q '^assets/source/'; then
+            echo 'Repository-only source artwork leaked into the release archive.' >&2
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
