@@ -9,31 +9,37 @@
     "description": "【触发】上下文使用率阈值",
     "type": "float",
     "default": 0.6,
-    "hint": "估计 token / 模型上下文窗口 达到该比例时触发后台压缩。0.6=60%；低于 0.1 按 0.1，高于 0.95 按 0.95。"
+    "hint": "估计 token / 模型上下文窗口 达到该比例时触发后台压缩。0.6=60%；运行时强制限制在 0.1-0.95。"
   },
   "min_messages": {
     "description": "【触发】最少消息数",
     "type": "int",
     "default": 20,
-    "hint": "历史消息数低于该值时不触发（避免过度压缩短对话）。"
+    "hint": "历史消息数低于该值时不触发（避免过度压缩短对话）；运行时最小按 1 处理。"
   },
   "cooldown_seconds": {
-    "description": "【触发】同一对话最小压缩间隔（秒）",
+    "description": "【触发】成功压缩后的冷却时间（秒）",
     "type": "int",
     "default": 300,
-    "hint": "同一对话在压缩后至少等待该秒数才会再次触发，避免反复压缩。"
+    "hint": "只有压缩结果成功写回后才进入该冷却；失败、空摘要或陈旧结果不会占用这段完整冷却时间。"
+  },
+  "retry_cooldown_seconds": {
+    "description": "【触发】失败/陈旧结果后的最小重试间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "压缩尝试失败、返回未变化历史或结果因竞态陈旧时，仅等待该短间隔后即可再次尝试；运行时最小按 0 处理。"
   },
   "check_delay_seconds": {
     "description": "【触发】回复后延迟检查秒数",
     "type": "int",
     "default": 5,
-    "hint": "LLM 回复后延迟该秒数再做检查，让本轮收尾，避免与当前请求竞争。"
+    "hint": "LLM 回复后延迟该秒数再做检查，让本轮收尾，避免与当前请求竞争；同一会话只保留一个后台检查/压缩任务。"
   },
   "keep_recent_ratio": {
     "description": "【压缩】保留最近上下文比例",
     "type": "float",
     "default": 0.15,
-    "hint": "压缩时保留最近 15% 原文（范围 0-0.3），其余汇总为摘要。"
+    "hint": "压缩时保留最近 15% 原文；运行时强制限制在 0-0.3，与 AstrBot 原生 LLMSummaryCompressor 一致。"
   },
   "compress_instruction": {
     "description": "【压缩】摘要提示词（留空用默认或 provider_settings 的 llm_compress_instruction）",
@@ -45,7 +51,7 @@
     "description": "【压缩】压缩用模型 ID（留空用 provider_settings.llm_compress_provider_id 或默认模型）",
     "type": "string",
     "default": "",
-    "hint": "例如 volcengine-ark/deepseek-v4-pro-ga-260813（走免费额度的压缩模型）；留空则用配置里的 llm_compress_provider_id。"
+    "hint": "可使用与主模型同级或独立的压缩模型；留空则用配置里的 llm_compress_provider_id，再退回默认模型。"
   },
   "command_enabled": {
     "description": "【命令】允许管理员 /compress 手动压缩",
@@ -69,7 +75,7 @@
       "(上下文|对话|聊天).*总结",
       "整理.*(上下文|对话|聊天)"
     ],
-    "hint": "任一正则命中管理员短消息（≤40字）即触发压缩。注意避免过宽导致误触发。"
+    "hint": "任一正则命中管理员短消息（≤40字）即触发压缩。无效正则会被忽略并记录警告，不会打断消息处理。"
   },
   "emphasis_instruction": {
     "description": "【压缩加权】摘要中额外保留/重点覆盖的内容",
