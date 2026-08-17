@@ -1,0 +1,2 @@
+# Repository-only source artwork. Keep it visible on GitHub but exclude it from git archive based release/source packages.
+assets/source/** export-ignore
