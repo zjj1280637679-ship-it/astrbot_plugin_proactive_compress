@@ -22,7 +22,7 @@ import json
 import time
 
 from astrbot.api import AstrBotConfig, logger, star
-from astrbot.api.event import AstrMessageEvent, LLMResponse, filter
+from astrbot.api.event import AstrMessageEvent, filter
 
 from astrbot.core.agent.context.compressor import LLMSummaryCompressor
 from astrbot.core.agent.message import (
@@ -32,7 +32,7 @@ from astrbot.core.agent.message import (
 from astrbot.core.utils.active_event_registry import active_event_registry
 from astrbot.core.utils.session_lock import session_lock_manager
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 DEFAULT_INSTRUCTION = (
     "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"

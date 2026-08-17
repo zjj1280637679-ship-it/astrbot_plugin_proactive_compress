@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 0.1.1 (2026-08-18)
+
+- 修复：移除 `LLMResponse` 从 `astrbot.api.event` 的错误导入（该名称实际定义于
+  `astrbot.core.provider.entities`；注解因 `from __future__ import annotations`
+  为字符串，无需运行时导入）。修复后插件可正常加载。
+
 ## 0.1.0 (2026-08-18)
 
 - 初始版本：后台主动上下文压缩。
