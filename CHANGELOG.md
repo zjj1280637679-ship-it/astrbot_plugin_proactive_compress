@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 0.3.0 (2026-08-18)
+
+- 修复：后台触发的 token 估算改为复用 AstrBot 原生 `EstimateTokenCounter`，
+  通过 `bind_checkpoint_messages` 后统一统计文本、thinking、tool calls、图片和音频；
+  不再把多模态 base64/data URL 当普通字符串计算。
+- 修复：后台检查与压缩合并为每 UMO 唯一的单一生命周期任务，消除
+  “检查通过后、注册压缩任务前”可能重复进入的 TOCTOU 窗口。
+- 修复：新增 `terminate()`，插件禁用/重载时取消并回收全部后台任务，
+  避免旧插件实例延迟醒来继续压缩或写回。
+- 修复：`_atomic_replace()` 改为返回是否真正写回；stale / 会话消失 /
+  历史解析失败时不再记录“后台压缩成功”日志。
+- 修复：冷却语义拆分为 `last_attempt` 与 `last_success`：
+  - 成功写回才进入 `cooldown_seconds`（默认 300 秒）；
+  - 失败、空结果、未变化或 stale 仅受 `retry_cooldown_seconds`
+    （默认 30 秒）限制。
+- 修复：`trigger_ratio` 运行时强制限制为 0.1–0.95，
+  `keep_recent_ratio` 强制限制为 0–0.3；负数延迟/冷却按 0 处理。
+- 修复：管理员自然语言触发中的无效正则会被忽略并记录警告，
+  不再可能因为 `re.error` 打断消息处理。
+- 元数据：版本升级至 0.3.0，声明 `astrbot_version: ">=4.27,<5"`；
+  移除错误的仅 `aiocqhttp` 平台限制（本插件本身与平台适配器无关）。
+- 文档：明确多模态计数、唯一后台任务、双冷却语义和生命周期行为。
+
 ## 0.2.1 (2026-08-18)
 
 - 修复：`EventMessageType` 不从 `astrbot.api.event` 导出 → 改用 `filter.EventMessageType`。
