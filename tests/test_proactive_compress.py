@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-import main as plugin_module
 from astrbot.core.agent.message import ImageURLPart, Message, TextPart
 from astrbot.core.provider.entities import LLMResponse
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+plugin_module = importlib.import_module("main")
 
 
 def _dump(role: str, content, **kwargs) -> dict:
