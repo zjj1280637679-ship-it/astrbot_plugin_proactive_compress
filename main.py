@@ -207,9 +207,11 @@ class ProactiveCompressPlugin(star.Star):
         success_cooldown = self._cfg_int_min("cooldown_seconds", 300)
         retry_cooldown = self._cfg_int_min("retry_cooldown_seconds", 30)
 
-        if now - self._last_success.get(umo, 0.0) < success_cooldown:
+        last_success = self._last_success.get(umo)
+        if last_success is not None and now - last_success < success_cooldown:
             return
-        if now - self._last_attempt.get(umo, 0.0) < retry_cooldown:
+        last_attempt = self._last_attempt.get(umo)
+        if last_attempt is not None and now - last_attempt < retry_cooldown:
             return
 
         conv_mgr = getattr(self.context, "conversation_manager", None)
