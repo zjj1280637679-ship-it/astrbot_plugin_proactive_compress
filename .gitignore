@@ -1,0 +1,6 @@
+# AstrBot 运行期会在插件目录内创建 data/（如 cmd_config.json 模板、t2i_templates）
+# 与 __pycache__——这些不属于插件源码，绝不提交。
+__pycache__/
+*.pyc
+data/
+*.log
