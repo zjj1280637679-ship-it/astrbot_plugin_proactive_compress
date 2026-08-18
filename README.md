@@ -105,7 +105,7 @@
 
 ## 兼容性
 
-AstrBot `>=4.27,<5`，依赖 `session_lock_manager`、`LLMSummaryCompressor`、`EstimateTokenCounter` 等当前 AstrBot 组件。
+AstrBot `>=4.27`，依赖 `session_lock_manager`、`LLMSummaryCompressor`、`EstimateTokenCounter` 等当前 AstrBot 组件。
 
 ## 许可
 

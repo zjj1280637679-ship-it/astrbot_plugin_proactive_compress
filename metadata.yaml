@@ -2,10 +2,10 @@ name: astrbot_plugin_proactive_compress
 display_name: "后台主动上下文压缩"
 desc: "对话变长时，它会在后台把旧内容整理成摘要、换回去——主对话不用停。管理员可以发 /compress，或直接说一句“压缩一下上下文”，还能顺带附上本次压缩的额外要求（如“重点保留装修方案”）。"
 short_desc: "对话变长时后台自动整理成摘要，主对话不停；/compress 或自然语言触发，可附临时要求"
-version: "0.3.1"
+version: "0.3.2"
 author: "羊魔大人"
 repo: "https://github.com/zjj1280637679-ship-it/astrbot_plugin_proactive_compress"
-astrbot_version: ">=4.27,<5"
+astrbot_version: ">=4.27"
 tags:
   - 上下文压缩
   - 主动压缩
