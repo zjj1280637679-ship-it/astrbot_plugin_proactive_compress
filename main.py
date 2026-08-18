@@ -40,6 +40,7 @@ from astrbot.api.event import (
     filter,
 )
 from astrbot.core.message.components import Plain
+from astrbot.core.star.filter.command import GreedyStr
 
 from astrbot.core.agent.context.compressor import LLMSummaryCompressor
 from astrbot.core.agent.context.token_counter import EstimateTokenCounter
@@ -50,7 +51,7 @@ from astrbot.core.agent.message import (
 from astrbot.core.utils.active_event_registry import active_event_registry
 from astrbot.core.utils.session_lock import session_lock_manager
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 DEFAULT_INSTRUCTION = (
     "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
@@ -66,7 +67,7 @@ DEFAULT_NL_PATTERNS = (
     r"(上下文|对话|聊天|记录).*压缩",
     r"总结.*(上下文|对话|聊天)",
     r"(上下文|对话|聊天).*总结",
-    r"整理.*(上下文|对话|聊天)",
+    r"整理.*(上下文|对话|聊天|记录)",
 )
 
 # Guard against our own reply text re-triggering the natural-language path.
@@ -144,8 +145,13 @@ class ProactiveCompressPlugin(star.Star):
         except Exception:
             return {}
 
-    def _build_instruction(self, umo: str) -> str:
-        """Combine the configured summary instruction with the admin emphasis."""
+    def _build_instruction(self, umo: str, extra: str | None = None) -> str:
+        """Combine the configured summary instruction with the admin emphasis.
+
+        ``extra`` is a one-off, per-request request (passed from /compress or a
+        natural-language trigger); it is distinct from the persistent
+        ``emphasis_instruction`` config and only applies to that compression.
+        """
         base = self._cfg_str("compress_instruction", "") or str(
             self._read_provider_settings(umo).get("llm_compress_instruction", "")
         ).strip()
@@ -158,6 +164,14 @@ class ProactiveCompressPlugin(star.Star):
                 "在摘要中特别保留、重点覆盖以下内容：\n"
                 f"{emphasis}\n"
                 "</emphasis_priority>"
+            )
+        extra = (extra or "").strip()
+        if extra:
+            base = (
+                f"{base}\n\n<extra_request>\n"
+                "本次压缩的额外要求：\n"
+                f"{extra}\n"
+                "</extra_request>"
             )
         return base
 
@@ -412,9 +426,11 @@ class ProactiveCompressPlugin(star.Star):
         umo: str,
         cid: str,
         exclude_event=None,
+        extra: str | None = None,
     ) -> tuple[str, str]:
         """Stop the running agent, then atomically compress under the session
-        lock. Returns (status, final_message).
+        lock. ``extra`` is a one-off per-request prompt for the compression
+        model. Returns (status, final_message).
         """
         conv_mgr = getattr(self.context, "conversation_manager", None)
         if conv_mgr is None:
@@ -424,7 +440,7 @@ class ProactiveCompressPlugin(star.Star):
         if provider is None:
             return "fail", "❌ 未找到压缩用模型（检查 compress_provider_id / llm_compress_provider_id）。"
         keep_ratio = self._keep_recent_ratio()
-        instruction = self._build_instruction(umo)
+        instruction = self._build_instruction(umo, extra)
 
         try:
             active_event_registry.request_agent_stop_all(umo, exclude=exclude_event)
@@ -481,18 +497,31 @@ class ProactiveCompressPlugin(star.Star):
 
     # ---------- natural-language admin trigger ----------
 
-    def _matches_nl_pattern(self, text: str) -> bool:
+    def _match_nl_pattern(self, text: str) -> str | None:
         for pattern in self._cfg_list("nl_patterns", DEFAULT_NL_PATTERNS):
             try:
                 if re.search(pattern, text):
-                    return True
+                    return pattern
             except re.error as exc:
                 logger.warning(
                     "Ignoring invalid proactive-compress regex %r: %s",
                     pattern,
                     exc,
                 )
-        return False
+        return None
+
+    @staticmethod
+    def _extract_nl_extra(text: str, pattern: str) -> str:
+        """Extract the one-off prompt that follows the matched intent phrase.
+
+        E.g. "压缩一下上下文，重点保留装修方案" -> "重点保留装修方案".
+        """
+        match = re.search(pattern, text)
+        if not match:
+            return ""
+        rest = text[match.end():].strip()
+        rest = rest.lstrip("，,。.;；：:、 ")
+        return rest
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=900000)
     async def nl_compress(self, event: AstrMessageEvent) -> None:
@@ -505,12 +534,14 @@ class ProactiveCompressPlugin(star.Star):
         text = (event.message_str or "").strip()
         if not text or text.startswith("/"):
             return
-        if len(text) > 40:
-            return  # short intent phrases only, avoid false positives
+        if len(text) > 80:
+            return  # intent phrase + short extra only, avoid false positives
         if any(marker in text for marker in _SELF_MARKERS):
             return  # ignore our own replies
-        if not self._matches_nl_pattern(text):
+        matched = self._match_nl_pattern(text)
+        if not matched:
             return
+        extra = self._extract_nl_extra(text, matched)
 
         umo = event.unified_msg_origin
         conv_mgr = getattr(self.context, "conversation_manager", None)
@@ -526,7 +557,7 @@ class ProactiveCompressPlugin(star.Star):
             )
         except Exception as exc:
             logger.debug("NL compress: status send failed: %s", exc)
-        _, final = await self._do_compress(umo, cid, exclude_event=event)
+        _, final = await self._do_compress(umo, cid, exclude_event=event, extra=extra)
         try:
             event.set_result(MessageEventResult().message(final).stop_event())
         except Exception as exc:
@@ -536,10 +567,11 @@ class ProactiveCompressPlugin(star.Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("compress", alias={"压缩上下文", "summarize"})
-    async def compress_command(self, event: AstrMessageEvent, _=None):
+    async def compress_command(self, event: AstrMessageEvent, query: GreedyStr = None):
         if not self._cfg_bool("command_enabled", True):
             yield event.plain_result("ℹ️ 手动压缩命令已关闭。")
             return
+        extra = str(query or "").strip()
         umo = event.unified_msg_origin
         conv_mgr = getattr(self.context, "conversation_manager", None)
         if conv_mgr is None:
@@ -551,7 +583,7 @@ class ProactiveCompressPlugin(star.Star):
             return
         keep_ratio = self._keep_recent_ratio()
         yield event.plain_result(f"⏳ 正在压缩上下文（保留最近 {keep_ratio:.0%}）…")
-        _, final = await self._do_compress(umo, cid, exclude_event=event)
+        _, final = await self._do_compress(umo, cid, exclude_event=event, extra=extra)
         yield event.plain_result(final)
 
     async def terminate(self) -> None:
