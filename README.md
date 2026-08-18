@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="astrbot_plugin_proactive_compress" width="128">
+</p>
+
 # astrbot_plugin_proactive_compress
 
 一个会在对话变长时，把旧内容整理成摘要的 AstrBot 插件。
